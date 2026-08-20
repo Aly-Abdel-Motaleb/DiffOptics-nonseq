@@ -76,6 +76,10 @@ def caustic(N, pyramid_i, lr=1e-3, maxit=100):
             torch.linspace(-R_square, R_square, M, device=device),
             torch.linspace(-R_square, R_square, M, device=device)
         )
+        #? P is aperture sampling spacing, which is used to add randomness to the ray origins 
+        #? if random=True. It is calculated based on 
+        #? the size of the square aperture (2*R_square) and the number of samples M. 
+        #? The factor of 2 ensures that the sampling covers the entire aperture area.
         p = 2*R_square / M
         if random:
             x = x + p * (torch.rand(M,M,device=device)-0.5)
@@ -108,6 +112,7 @@ def caustic(N, pyramid_i, lr=1e-3, maxit=100):
         return I
 
     def render(spp=1):
+        #! here the spp should be implemented as a for loop and then average the results.
         I = torch.zeros((N_total,N_total), device=device)
         ray_init, irr = sample_ray(M=24, random=True) # Reduce M if your GPU memory is low
         I = render_single(I, ray_init, irr)

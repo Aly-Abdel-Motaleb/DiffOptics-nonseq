@@ -6,15 +6,16 @@ from pathlib import Path
 from tqdm import tqdm
 
 import sys
-sys.path.append("../")
+_here = Path(__file__).resolve().parent
+sys.path.append(str(_here.parent))
 import diffoptics as do
 
 # initialize a lens
-device = torch.device('cuda')
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 lens = do.Lensgroup(device=device)
 
 # load optics
-lens.load_file(Path('./lenses/DoubleGauss/US02532751-1.txt'))
+lens.load_file(_here / 'lenses/DoubleGauss/US02532751-1.txt')
 
 # set sensor pixel size and film size
 pixel_size = 6.45e-3 # [mm]
@@ -27,7 +28,7 @@ lens.prepare_mts(pixel_size, film_size)
 # create a dummy screen
 z0 = 10e3 # [mm]
 pixelsize = 1.1 # [mm]
-texture = cv2.cvtColor(cv2.imread('./images/squirrel.jpg'), cv2.COLOR_BGR2RGB)
+texture = cv2.cvtColor(cv2.imread(str(_here / 'images/squirrel.jpg')), cv2.COLOR_BGR2RGB)
 texture = np.flip(texture.astype(np.float32), axis=(0,1)).copy()
 texture_torch = torch.Tensor(texture).to(device=device)
 texturesize = np.array(texture.shape[0:2])
@@ -70,4 +71,4 @@ for wavelength_id, wavelength in enumerate(wavelengths):
 I_rendered = torch.stack(Is, axis=-1).numpy().astype(np.uint8)
 plt.imshow(I_rendered)
 plt.show()
-plt.imsave('I_rendered.png', I_rendered)
+plt.imsave(str(_here / 'I_rendered.png'), I_rendered)

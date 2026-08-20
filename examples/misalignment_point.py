@@ -8,7 +8,8 @@ import cv2
 import imageio
 
 import sys
-sys.path.append("../")
+HERE = Path(__file__).resolve().parent
+sys.path.append(str(HERE.parent))
 import diffoptics as do
 
 """
@@ -24,7 +25,7 @@ device = do.init()
 lens = do.Lensgroup(device=device)
 
 # ==== Load lens file
-lens.load_file(Path('./lenses/Thorlabs/LA1131.txt'))
+lens.load_file(HERE / 'lenses/Thorlabs/LA1131.txt')
 lens.d_sensor = torch.Tensor([56.0]).to(device) # [mm] sensor distance
 lens.plot_setup2D(with_sensor=True)
 R = lens.surfaces[0].r
@@ -94,7 +95,7 @@ def loss(I, I_mea):
 
 
 # read image
-img = imread('./data/20210304/ref2.tif') # for now we use grayscale
+img = imread(str(HERE / 'data/20210304/ref2.tif')) # for now we use grayscale
 img = img.astype(float)
 I_mea = cv2.resize(img, dsize=(N_total, N_total), interpolation=cv2.INTER_AREA)
 I_mea = np.maximum(0.0, I_mea - np.median(I_mea))
@@ -112,7 +113,7 @@ def crop(I):
     c = 200
     return I[c:I.shape[0]-c, c:I.shape[1]-c]
 
-opath = Path('misalignment_point')
+opath = HERE / 'misalignment_point'
 opath.mkdir(parents=True, exist_ok=True)
 def save(I_mea, Is):
     images = []

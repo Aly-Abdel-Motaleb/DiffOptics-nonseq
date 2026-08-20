@@ -5,8 +5,10 @@ from pathlib import Path
 from tqdm import tqdm
 from datetime import datetime
 
-import sys
+import sys, os
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append("../")
+
 import diffoptics as do
 from utils_end2end import dict_to_tensor, tensor_to_dict, load_deblurganv2, ImageFolder
 torch.manual_seed(0)

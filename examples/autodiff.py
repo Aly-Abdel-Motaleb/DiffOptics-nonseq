@@ -4,7 +4,7 @@ import torch
 import matplotlib.pyplot as plt
 
 import sys
-sys.path.append("../")
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import diffoptics as do
 
 # initialize a lens

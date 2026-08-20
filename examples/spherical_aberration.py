@@ -1,9 +1,11 @@
+import os
+
 import torch
 import matplotlib.pyplot as plt
 from pathlib import Path
 
 import sys
-sys.path.append("../")
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import diffoptics as do
 
 # initialization
@@ -12,7 +14,7 @@ device = torch.device('cpu')
 
 # load target lens
 lens = do.Lensgroup(device=device)
-lens.load_file(Path('./lenses/Thorlabs/ACL5040U.txt'))
+lens.load_file(Path(__file__).parent / 'lenses' / 'ThorLabs' / 'ACL5040U.txt')
 print(lens.surfaces[0])
 
 # generate array of rays
