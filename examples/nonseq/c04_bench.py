@@ -524,23 +524,34 @@ def _measure(arm, R, src_seed, device, nf, nb, chunk, n_rep):
     def one_pass(phases=None, accumulate=False):
         acc = {'phi': {}, 'lw': 0.0, 'lc': 0.0, 'lt': 0.0, 'n': 0,
                'p_fwd': [], 'w_fwd': [], 'p_back': [], 'w_back': [],
-               'uniq': set()}
+               'uniq_max': 0}
         for ci, cn in enumerate(chunks):
             term, tally, cl = _trace(arm, scene, kind, cn, src_seed + 1000 * ci,
                                      mc_seed + 1000 * ci, device, phases)
             if not accumulate:
                 continue
-            acc['lw'] += float(term['w'].sum())
-            acc['lc'] += float(tally['culled'])
-            acc['lt'] += float(tally['truncated'])
+            # EVERY chunk is a self-contained source carrying the FULL launched
+            # power: `sample_point_source` splits P over the rays it is asked
+            # for, so a chunk of `cn` rays gives each ray P/cn, not P/R.  Summing
+            # chunks unscaled therefore multiplies the ledger by len(chunks) -
+            # at R=3e7 with 2e6-ray chunks that is a 15x energy inflation, and
+            # the path fractions inflate with it.  Weight each chunk by its
+            # share of the batch so the pieces add up to one source.
+            sc = cn / R
+            acc['lw'] += float(term['w'].sum()) * sc
+            acc['lc'] += float(tally['culled']) * sc
+            acc['lt'] += float(tally['truncated']) * sc
             acc['n'] += int(term['w'].numel())
             for side in ('fwd', 'back'):
                 acc['p_' + side].append(cl['p_' + side])
-                acc['w_' + side].append(cl['w_' + side])
+                acc['w_' + side].append(cl['w_' + side] * sc)
             for kk, vv in ref.path_powers(term).items():
-                acc['phi'][kk] = acc['phi'].get(kk, 0.0) + vv
-            u = torch.unique(term['w'])
-            acc['uniq'].update(float(x) for x in u[:4])
+                acc['phi'][kk] = acc['phi'].get(kk, 0.0) + vv * sc
+            # Uniformity is a per-chunk property: chunks legitimately differ
+            # from each other in weight when R is not a multiple of the chunk
+            # size, and comparing across them would flag that as a failure.
+            acc['uniq_max'] = max(acc['uniq_max'],
+                                  int(torch.unique(term['w']).numel()))
         return acc
 
     # --- warmup for this size, then the timed totals ------------------------
@@ -603,7 +614,7 @@ def _measure(arm, R, src_seed, device, nf, nb, chunk, n_rep):
     total = acc['lw'] + acc['lc'] + acc['lt']
     row['ledger_rel'] = abs(total / ref.PHI_CAP - 1.0)
     row['phi_off'] = acc['lw'] - row['phi_fwd'] - row['phi_back']
-    row['weights_uniform'] = int(len(acc['uniq']) <= 1)
+    row['weights_uniform'] = int(acc['uniq_max'] <= 1)
 
     phi = acc['phi']
     for name, col in (('T1T2', 'f_T1T2'), ('R1', 'f_R1'),
@@ -637,6 +648,12 @@ def load_done(path):
                 f'{path}: header does not match this version of the harness.\n'
                 f'  move it aside, or re-run with the code that wrote it.')
         for r in rd:
+            # A run that FAILED a gate is not done - it is a bug to be fixed and
+            # re-run.  Only 'ok' and 'oom' are terminal ('oom' would just OOM
+            # again).  So after a harness fix, re-running the same cell redoes
+            # exactly the broken rows and leaves the good ones alone.
+            if r.get('status') not in ('ok', 'oom'):
+                continue
             try:
                 done.add(tuple(r[k] for k in RUN_KEY))
             except KeyError:
