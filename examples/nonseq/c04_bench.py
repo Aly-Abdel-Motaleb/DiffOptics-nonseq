@@ -348,6 +348,14 @@ def bins_for(R, k, target=EPS_TARGET, snap=BIN_SNAP, n_min=BIN_MIN,
 
 
 MIN_CAL_COUNT = 100     # below this the p10 quantile saturates on small integers.
+
+# One ray count gets its per-bin COUNT maps dumped to .npz so the distribution
+# behind the eps_p10 headline can be drawn.  1e6 is the rung to pick: large
+# enough that the forward grid is 96x96 rather than a floored 16x16, small
+# enough to be cheap and to be present in every partial sweep.  Only the first
+# seed is dumped - three seeds of the same distribution add nothing to a
+# histogram.
+HIST_RAYS = int(1e6)
                         # 100 is not arbitrary: it IS the 10 % rule, so any bin
                         # too sparse to calibrate on is a bin too sparse to use.
 CORE_FRAC = 0.5         # core = bins holding >= this fraction of the median count
@@ -375,7 +383,7 @@ def _core_mask(C):
     return C >= CORE_FRAC * torch.quantile(C[lit], 0.5)
 
 
-def noise_stats(p, w, n, half, k_cal=None, R=None):
+def noise_stats(p, w, n, half, k_cal=None, R=None, keep=False):
     """Per-bin MC noise on one receiver, measured rather than predicted.
 
     Uses `bilinear=False` for BOTH moments. A bilinear bin holds
@@ -395,6 +403,9 @@ def noise_stats(p, w, n, half, k_cal=None, R=None):
     and letting those bins set N would shrink the grid without limit. The
     edge is still reported, through `lit_frac` and `frac_above`, which are taken
     over every lit bin and so do include it.
+
+    `keep=True` additionally returns the raw count map under `_C`, for the
+    histogram; the caller pops it before writing the CSV row.
     """
     out = {k: NAN for k in ('eps_p10', 'eps_median', 'eps_peak',
                             'frac_above', 'lit_frac', 'n_lit', 'k_meas')}
@@ -422,6 +433,8 @@ def noise_stats(p, w, n, half, k_cal=None, R=None):
         # k as this run actually realised it. Flat vs R is the invariant; a
         # TREND means the geometry became R-dependent, which it must not be.
         out['k_meas'] = float(torch.quantile(C[core], 0.10)) * n * n / R
+    if keep:
+        out['_C'] = C.detach().cpu().numpy()
     return out
 
 
@@ -506,7 +519,8 @@ def _calibrate_once(arm, device, R_pilot, src_seed, candidates):
 
 
 # ------------------------------------------------------------------- one run
-def _measure(arm, R, src_seed, device, nf, nb, chunk, n_rep):
+def _measure(arm, R, src_seed, device, nf, nb, chunk, n_rep,
+             hist_path=None):
     """Trace `n_rep` timed repeats plus one phase-broken repeat. Returns a dict.
 
     Repeat 0 is untimed and warms the allocator for this size. Repeats 1..n_rep
@@ -595,12 +609,16 @@ def _measure(arm, R, src_seed, device, nf, nb, chunk, n_rep):
 
     t0 = time.perf_counter()
     _sync(device)
+    hist = {}
     for side, half, n in (('fwd', ref.R_RECV, nf), ('back', ref.R_BACK, nb)):
         p = (torch.cat(acc['p_' + side]) if acc['p_' + side]
              else torch.zeros(0, 3, device=device))
         w = (torch.cat(acc['w_' + side]) if acc['w_' + side]
              else torch.zeros(0, device=device))
-        st = noise_stats(p, w, n, half, R=R)
+        st = noise_stats(p, w, n, half, R=R, keep=hist_path is not None)
+        if hist_path is not None and '_C' in st:
+            hist[side] = st.pop('_C')
+        st.pop('_C', None)
         for kk, vv in st.items():
             row[kk + '_' + side] = vv
         row['phi_' + side] = float(w.sum())
@@ -629,6 +647,10 @@ def _measure(arm, R, src_seed, device, nf, nb, chunk, n_rep):
             for n2, v in (('T1T2', 0.64), ('R1', 0.20), ('T1R2T1', 0.128))))
     else:
         row['paths_ok'] = -1
+
+    if hist_path is not None and hist:
+        np.savez_compressed(hist_path, arm=arm, rays=R, src_seed=src_seed,
+                            **{k: v for k, v in hist.items()})
     return row
 
 
@@ -753,10 +775,14 @@ def sweep(args, kcal, csv_path):
         head = (f"[{i:3d}/{len(todo)}] {r['arm']:15s} R={r['rays']:>9d} "
                 f"s={r['src_seed']:<3d} N={r['n_bins_fwd']}/{r['n_bins_back']}")
         print(head, end='', flush=True)
+        hp = None
+        if (r['rays'] == HIST_RAYS and r['mode'] == 'adaptive'
+                and r['src_seed'] == SEEDS_SRC[0] and r['rep'] == args.reps):
+            hp = os.path.join(args.out, f"hist_{r['arm']}_{device.type}.npz")
         try:
             row.update(_measure(r['arm'], r['rays'], r['src_seed'], device,
                                 r['n_bins_fwd'], r['n_bins_back'], r['chunk'],
-                                r['rep']))
+                                r['rep'], hist_path=hp))
             _report(row)
         except Exception as e:                       # noqa: BLE001
             if not _is_oom(e):
@@ -936,6 +962,99 @@ def make_plots(rows, out):
         print(f'  wrote {p}')
 
 
+def make_hist(out):
+    """Per-bin distributions at R=1e6, from the count maps dumped by the sweep.
+
+    The sweep reports one number, `eps_p10`. These two rows are what that number
+    is a summary of:
+
+      top     how many rays each bin caught. The spread here is NOT shot noise -
+              it is mostly the irradiance profile of the receiver, so do not
+              read it against a Poisson curve. What matters is where the bulk
+              sits relative to the 100 rays that 10 % noise requires.
+      bottom  per-bin noise itself, `eps = 1/sqrt(count)`, which is the exact
+              identity here because `trace_mc` leaves every weight bit-exactly
+              equal. The 10 % line and the fraction of lit bins past it are the
+              requirement, read straight off the plot.
+
+    Grey is every lit bin, blue the core (see `_core_mask`). The gap between
+    them is the beam edge: bins that are noisy because they are half-covered,
+    not because the ray budget is short. Drawn for HIST_RAYS only.
+    """
+    import glob
+    files = sorted(glob.glob(os.path.join(out, 'hist_*.npz')))
+    if not files:
+        return None
+    panels = []
+    for f in files:
+        z = np.load(f, allow_pickle=False)
+        arm = str(z['arm'])
+        for side in ('fwd', 'back'):
+            if side in z:
+                panels.append((arm, side, z[side]))
+    if not panels:
+        return None
+
+    plt = _pyplot()
+    fig, ax = plt.subplots(2, len(panels), figsize=(5.0 * len(panels), 7.2),
+                           squeeze=False)
+    for j, (arm, side, C) in enumerate(panels):
+        lit = C[C > 0].astype(float)
+        core = C[C >= 0.5 * np.median(lit)].astype(float)
+        p10 = float(np.quantile(core, 0.10))
+        need = 1.0 / EPS_TARGET ** 2               # rays for 10 % noise
+        wide = lit.max() / max(lit.min(), 1.0) > 30.0
+
+        a = ax[0][j]
+        bins = (np.geomspace(max(lit.min(), 0.5), lit.max(), 60) if wide
+                else np.linspace(0, lit.max(), 60))
+        a.hist(lit, bins=bins, color='0.80', label=f'lit  (n={lit.size})')
+        a.hist(core, bins=bins, color='tab:blue', label=f'core  (n={core.size})')
+        if wide:
+            a.set_xscale('log')
+        a.axvline(need, color='r', ls='--', lw=1.2,
+                  label=f'{EPS_TARGET:.0%} noise needs {need:.0f}')
+        a.axvline(p10, color='tab:orange', ls=':', lw=1.6,
+                  label=f'core p10 = {p10:.0f}')
+        a.set(xlabel='rays caught by a bin', ylabel='bins',
+              title=f'{arm}  {side}   R={HIST_RAYS:.0e}   '
+                    f'{C.shape[0]}x{C.shape[1]}')
+        a.legend(fontsize=7); a.grid(alpha=.3)
+
+        # eps = 1/sqrt(count): exact here, because every MC weight is equal.
+        b = ax[1][j]
+        e_lit, e_core = 1.0 / np.sqrt(lit), 1.0 / np.sqrt(core)
+        above = float((e_lit > EPS_TARGET).mean())
+        # A few beam-edge bins hold one or two rays and sit at eps = 1.0, which
+        # would stretch the axis until the distribution that matters is a single
+        # spike. Clip the view at 3x target and pile the overflow into the last
+        # bin, so it stays visible without setting the scale.
+        hi = 3.0 * EPS_TARGET
+        eb = np.linspace(0, hi, 60)
+        n_over = int((e_lit > hi).sum())
+        b.hist(np.clip(e_lit, 0, hi), bins=eb, color='0.80', label='lit')
+        b.hist(np.clip(e_core, 0, hi), bins=eb, color='tab:blue', label='core')
+        if n_over:
+            b.annotate(f'{n_over} lit bins off-scale\n(eps up to '
+                       f'{e_lit.max():.2f})', xy=(0.97, 0.55),
+                       xycoords='axes fraction', ha='right', fontsize=7,
+                       color='0.35')
+        b.axvline(EPS_TARGET, color='r', ls='--', lw=1.2,
+                  label=f'target {EPS_TARGET:.0%}')
+        b.axvline(1 / math.sqrt(p10), color='tab:orange', ls=':', lw=1.6,
+                  label=f'eps_p10 = {1/math.sqrt(p10):.3f}')
+        b.set(xlabel='per-bin relative noise  eps = 1/sqrt(count)',
+              ylabel='bins',
+              title=f'{above:.1%} of lit bins above target')
+        b.legend(fontsize=7); b.grid(alpha=.3)
+
+    fig.tight_layout()
+    q = os.path.join(out, 'bin_count_hist.png')
+    fig.savefig(q, dpi=140); plt.close(fig)
+    print('  wrote', q)
+    return q
+
+
 def make_json(rows, out, kcal):
     """Derived summary. The CSV is the source of truth; this is rebuilt from it.
 
@@ -1043,6 +1162,7 @@ def main():
         kcal = json.load(open(calib_path)) if os.path.exists(calib_path) else {}
         if not args.json_only:
             make_plots(rows, args.out)
+            make_hist(args.out)
         make_json(rows, args.out, kcal)
         return 0
 
@@ -1089,6 +1209,7 @@ def main():
     rows = _read(csv_path)
     if rows:
         make_plots(rows, args.out)
+        make_hist(args.out)
         s = make_json(rows, args.out, kcal)
         print('\n  ' + '-' * 66)
         for a, d in s['arms'].items():
