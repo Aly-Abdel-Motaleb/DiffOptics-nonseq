@@ -115,7 +115,12 @@ except ImportError:
 
 
 # ------------------------------------------------------------------ the matrix
-RAYS_FULL = [int(x) for x in (1e4, 3e4, 1e5, 3e5, 1e6, 3e6, 1e7, 3e7, 1e8)]
+# 2e7 sits deliberately either side of the predicted monolithic wall
+# (~28e6 nonseq, ~50e6 seq on 16 GB): it is the rung that turns the wall
+# from an extrapolation into a bracket.  7 rungs x 3 seeds + 2e7/3e7/1e8
+# x 1 seed = 24 runs per arm.
+RAYS_FULL = [int(x) for x in (1e4, 3e4, 1e5, 3e5, 1e6, 3e6, 1e7,
+                              2e7, 3e7, 1e8)]
 RAYS_SMOKE = [int(1e4), int(1e5)]
 RAYS_FRESNEL = [int(1e5), int(1e6), int(1e7)]
 RAYS_SPLIT = [int(1e4), int(1e5), int(1e6)]
@@ -716,7 +721,8 @@ def plan_runs(args, kcal):
             nf, nif, epf, flf = bins_for(R, k['fwd'])
             nb, nib, epb, flb = bins_for(R, k['back']) if HAS_BACK[arm] \
                 else (0, NAN, NAN, 'none')
-            chunk = CHUNK_SIZE if (R > CHUNK_ABOVE and not args.no_chunk) else 0
+            chunk = (int(args.chunk_size)
+                     if (R > args.chunk_above and not args.no_chunk) else 0)
             seeds = SEEDS_SRC[:1] if (R > int(1e7) or args.smoke
                                       or arm in ('fresnel', 'split_R02')) \
                 else SEEDS_SRC[:args.seeds]
@@ -768,7 +774,21 @@ def sweep(args, kcal, csv_path):
         return
 
     gpu = _gpu_name(device)
+    # First monolithic OOM per arm. Once a monolithic run has hit the VRAM wall,
+    # every LARGER monolithic run of that arm hits it too - retrying 3e7 and then
+    # 1e8 just to watch them fail costs minutes of allocator thrash for no datum.
+    # So the wall is measured once, the bigger monolithic rungs are skipped, and
+    # their memory is supplied by the linear extrapolation drawn dotted in
+    # memory_vs_rays.png. Chunked rows are NOT skipped: chunking is what carries
+    # the noise curve past the wall, and its peak does not grow with R.
+    oom_at = {}
     for i, r in enumerate(todo, 1):
+        w = oom_at.get(r['arm'])
+        if w is not None and not r['chunk'] and r['rays'] >= w:
+            print(f"[{i:3d}/{len(todo)}] {r['arm']:15s} R={r['rays']:>9d} "
+                  f"   skipped - past the measured OOM wall at {w:.0e}; "
+                  f"memory comes from the fit")
+            continue
         row = dict(r)
         row.update(ts=datetime.now().isoformat(timespec='seconds'),
                    dtype=str(torch.get_default_dtype()).split('.')[-1],
@@ -798,6 +818,8 @@ def sweep(args, kcal, csv_path):
                        note=str(e).splitlines()[0][:180],
                        t_wall_s=NAN, mem_alloc_mb=NAN)
             print('   OOM' if oom else f'   ERROR {type(e).__name__}: {e}')
+            if oom and not r['chunk']:
+                oom_at.setdefault(r['arm'], r['rays'])
             if not oom:
                 traceback.print_exc()
         finally:
@@ -815,9 +837,18 @@ def sweep(args, kcal, csv_path):
     print('\n  completed rows per arm (of the planned matrix)')
     for arm in args.arms:
         want = [r for r in runs if r['arm'] == arm]
+        w = oom_at.get(arm)
+        # A rung skipped because it is past the measured wall is accounted for,
+        # not missing: it has an answer (the extrapolation), just not a measured
+        # one. Only genuinely outstanding rows should read INCOMPLETE.
+        skipped = [r for r in want
+                   if w is not None and not r['chunk'] and r['rays'] >= w]
         got = [r for r in want if _key(r) in done]
-        mark = 'ok' if len(got) == len(want) else 'INCOMPLETE'
-        print(f'    {arm:15s} {len(got):3d}/{len(want):<3d} {mark}')
+        acct = len(got) + len(skipped)
+        mark = 'ok' if acct >= len(want) else 'INCOMPLETE'
+        extra = (f'  ({len(skipped)} past the OOM wall at {w:.0e}, '
+                 f'memory from the fit)' if skipped else '')
+        print(f'    {arm:15s} {len(got):3d}/{len(want):<3d} {mark}{extra}')
 
 
 def _report(row):
@@ -904,6 +935,12 @@ def make_plots(rows, out):
     plt = _pyplot()
     arms = sorted({r['arm'] for r in rows})
     written = []
+    # Read from the live device rather than the CSV: adding a column would make
+    # the harness refuse to append to every results.csv written before now, and
+    # a missing VRAM line costs one annotation, not a plot.
+    vram_mb = None
+    if torch.cuda.is_available():
+        vram_mb = torch.cuda.mem_get_info()[1] / 2 ** 20
 
     # 1 - noise. The whole point: does the adaptive rule hold the 10 % line?
     fig, ax = plt.subplots(1, 2, figsize=(13, 5))
@@ -955,23 +992,65 @@ def make_plots(rows, out):
 
     # 3 - memory. Monolithic only: a chunked row's peak is one chunk's peak and
     # plotting the two together would claim a memory number that is not real.
-    fig, ax = plt.subplots(figsize=(7, 5))
-    for a in arms:
-        rs = [r for r in rows if r['arm'] == a and r['mem_mode'] == 'monolithic']
-        R, m = _agg(rs, a, field='mem_alloc_mb')
-        if R.size:
-            ax.loglog(R, m, 'o-', label=a + ' allocated')
+    fig, ax = plt.subplots(figsize=(7.6, 5))
+    r_max = max((r['rays'] for r in rows), default=1e8)
+    walls = []
+    # RESERVED only, one line per arm. Allocated is the tidier number but it is
+    # not the one that OOMs: the allocator fails when it cannot RESERVE, and the
+    # gap between the two (measured ~1.3x, pure fragmentation) is exactly the
+    # margin that decides whether a run fits. Plotting both put four lines on
+    # top of each other and made the figure unreadable; allocated is still
+    # recorded in the CSV and still drives `bytes_per_ray` in results.json.
+    for ai, a in enumerate(arms):
+        col = f'C{ai}'
+        rs = [r for r in rows if r['arm'] == a and r['mem_mode'] == 'monolithic'
+              and r['status'] == 'ok']
         R, m = _agg(rs, a, field='mem_reserved_mb')
-        if R.size:
-            ax.loglog(R, m, 's--', lw=1, alpha=.6, label=a + ' reserved')
-    for r in rows:
-        if r['status'] == 'oom':
-            ax.axvline(r['rays'], color='r', ls=':', lw=1)
-    if any(r['status'] == 'oom' for r in rows):
-        ax.plot([], [], 'r:', label='OOM')
-    ax.set(xlabel='rays launched', ylabel='peak memory [MB]',
-           title='memory (monolithic runs only)')
-    ax.legend(fontsize=7); ax.grid(alpha=.3, which='both')
+        Ra, ma = _agg(rs, a, field='mem_alloc_mb')
+        if not R.size:
+            continue
+        ax.loglog(R, m, 'o-', color=col, lw=2, ms=5, label=f'{a}  measured')
+        if R.size < 2 or Ra.size < 2:
+            continue
+        # The extrapolation is fitted on ALLOCATED, not on the reserved curve
+        # plotted here. Allocated is linear in R by construction (trace_mc is
+        # flat-[N]-wide and never compacts); reserved carries a large constant
+        # from allocator warmup - 480 MB at 1e4 falling to 30 MB at 3e4 - which
+        # is non-monotone and drives a straight-line fit NEGATIVE. So: fit the
+        # physics on allocated, then scale up by the measured fragmentation
+        # ratio to land back on the reserved axis, since reserved is what OOMs.
+        bpr = float(np.polyfit(Ra, ma * 2 ** 20, 1)[0])
+        big = R >= R.max() / 30.0
+        frag = float(np.median(m[big] / ma[big])) if big.any() else 1.0
+        wall = vram_mb * 2 ** 20 / (bpr * frag) if vram_mb else 0.0
+        xs = np.geomspace(R.max(), max(r_max, R.max(), wall) * 1.6, 48)
+        ax.loglog(xs, np.polyval(np.polyfit(Ra, ma, 1), xs) * frag, ':',
+                  color=col, lw=1.8, alpha=.75,
+                  label=f'{a}  predicted, {bpr:.0f} B/ray x {frag:.2f} frag')
+        if wall:
+            walls.append((a, col, wall))
+            print(f'    {a}: predicted monolithic wall {wall:.2e} rays '
+                  f'({bpr:.0f} B/ray, {vram_mb/1024:.0f} GB)')
+
+    if vram_mb:
+        ax.axhline(vram_mb, color='k', lw=1.2, alpha=.7)
+        lo, hi_y = ax.get_ylim()
+        ax.set_ylim(lo, max(hi_y, vram_mb * 2.5))
+        ax.text(0.985, vram_mb * 1.1, f'device VRAM {vram_mb/1024:.0f} GB',
+                transform=ax.get_yaxis_transform(), ha='right',
+                fontsize=8, alpha=.85)
+    # The observed OOM is what the dotted lines are checked against: a predicted
+    # wall near it validates the linear claim; a large gap voids it.
+    ooms = sorted({r['rays'] for r in rows if r['status'] == 'oom'})
+    for x in ooms:
+        ax.axvline(x, color='r', ls='--', lw=1.6, alpha=.85)
+    if ooms:
+        ax.plot([], [], 'r--', lw=1.6, label=f'observed OOM  {ooms[0]:.0e}')
+
+    ax.set(xlabel='rays launched', ylabel='peak memory reserved [MB]',
+           title='memory: measured (solid) vs predicted past the wall (dotted)')
+    ax.legend(fontsize=8, loc='upper left', framealpha=.9)
+    ax.grid(alpha=.3, which='both')
     fig.tight_layout(); p = os.path.join(out, 'memory_vs_rays.png')
     fig.savefig(p, dpi=110); plt.close(fig); written.append(p)
 
@@ -1144,6 +1223,14 @@ def main():
                     help='add the fixed-N sub-sweep for the -1/2 gate')
     ap.add_argument('--no-chunk', action='store_true',
                     help='stay monolithic everywhere; finds the OOM wall sooner')
+    ap.add_argument('--chunk-above', type=float, default=CHUNK_ABOVE,
+                    help='chunk only above this ray count (default 1e7). Raise '
+                         'it to push the monolithic memory curve further before '
+                         'chunked rows take over - chunked rows carry no usable '
+                         'B/ray datum. Budget: R * B_per_ray < VRAM, with '
+                         '~300 B/ray seq and ~540 B/ray nonseq.')
+    ap.add_argument('--chunk-size', type=float, default=CHUNK_SIZE,
+                    help='rays per chunk once chunking kicks in (default 2e6)')
     ap.add_argument('--calibrate', action='store_true', help='remeasure k')
     ap.add_argument('--calibrate-only', action='store_true')
     ap.add_argument('--plots-only', action='store_true')
