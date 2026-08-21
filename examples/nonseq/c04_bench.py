@@ -132,7 +132,14 @@ EPS_TARGET = 0.10       # the 10 % rule
 BIN_SNAP = 16           # snap N DOWN to a multiple of this
 BIN_MIN, BIN_MAX = 16, 2048
 
-CHUNK_ABOVE = int(1e7)  # above this, chunk instead of going monolithic
+# Above this, chunk instead of going monolithic.  Set at 5e7 so EVERY rung up
+# to and including 3e7 is traced monolithically on BOTH arms: a chunked row's
+# peak memory measures one chunk, not R, so a chunked arm and a monolithic arm
+# cannot be compared rung for rung.  Monolithic everywhere is also what lets an
+# arm reach - and report - its own OOM wall ("nonseq OOMs at 3e7, seq does not")
+# instead of quietly surviving on chunks.  Only 1e8 chunks by default; use
+# `--chunk-above 1e7` to extend the noise curve past the wall on purpose.
+CHUNK_ABOVE = int(5e7)
 CHUNK_SIZE = int(2e6)
 
 # fixed-N sub-sweep, for the -1/2 slope gate (verification 1)
