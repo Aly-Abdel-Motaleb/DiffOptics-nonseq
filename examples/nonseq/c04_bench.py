@@ -999,65 +999,81 @@ def make_plots(rows, out):
 
     # 3 - memory. Monolithic only: a chunked row's peak is one chunk's peak and
     # plotting the two together would claim a memory number that is not real.
-    fig, ax = plt.subplots(figsize=(7.6, 5))
-    r_max = max((r['rays'] for r in rows), default=1e8)
+    #
+    # LINEAR y in GB, and an EVENLY SPACED (categorical) x. Log-log is the right
+    # frame for a slope but the wrong one for a magnitude: on a log y axis
+    # 2.9 GB and 5.1 GB sit a few millimetres apart and the reader concludes the
+    # two tracers cost about the same. They do not - one runs out of memory an
+    # entire rung before the other, and that gap is the finding. Linear GB
+    # against evenly spaced rungs shows the real separation, and the VRAM limit
+    # becomes a line the curves visibly run into rather than an afterthought.
+    fig, ax = plt.subplots(figsize=(8.4, 4.6))
     walls = []
-    # RESERVED only, one line per arm. Allocated is the tidier number but it is
-    # not the one that OOMs: the allocator fails when it cannot RESERVE, and the
-    # gap between the two (measured ~1.3x, pure fragmentation) is exactly the
-    # margin that decides whether a run fits. Plotting both put four lines on
-    # top of each other and made the figure unreadable; allocated is still
-    # recorded in the CSV and still drives `bytes_per_ray` in results.json.
-    for ai, a in enumerate(arms):
+    rungs = sorted({r['rays'] for r in rows
+                    if r['mem_mode'] == 'monolithic' or r['status'] == 'oom'})
+    if not rungs:
+        rungs = sorted({r['rays'] for r in rows})
+    xi = {R: i for i, R in enumerate(rungs)}
+
+    def _tick(v):
+        e = int(math.floor(math.log10(v)))
+        m = v / 10 ** e
+        return (rf'${m:.0f}\times10^{{{e}}}$' if abs(m - 1) > .05
+                else f'$10^{{{e}}}$')
+
+    for ai, a_ in enumerate(arms):
         col = f'C{ai}'
-        rs = [r for r in rows if r['arm'] == a and r['mem_mode'] == 'monolithic'
+        rs = [r for r in rows if r['arm'] == a_ and r['mem_mode'] == 'monolithic'
               and r['status'] == 'ok']
-        R, m = _agg(rs, a, field='mem_reserved_mb')
-        Ra, ma = _agg(rs, a, field='mem_alloc_mb')
+        R, m = _agg(rs, a_, field='mem_reserved_mb')
+        Ra, ma = _agg(rs, a_, field='mem_alloc_mb')
         if not R.size:
             continue
-        ax.loglog(R, m, 'o-', color=col, lw=2, ms=5, label=f'{a}  measured')
+        ax.plot([xi[v] for v in R], m / 1024, 'o-', color=col, lw=1.8, ms=6,
+                mfc='none', mew=1.6, label=a_)
         if R.size < 2 or Ra.size < 2:
             continue
-        # The extrapolation is fitted on ALLOCATED, not on the reserved curve
-        # plotted here. Allocated is linear in R by construction (trace_mc is
-        # flat-[N]-wide and never compacts); reserved carries a large constant
-        # from allocator warmup - 480 MB at 1e4 falling to 30 MB at 3e4 - which
-        # is non-monotone and drives a straight-line fit NEGATIVE. So: fit the
-        # physics on allocated, then scale up by the measured fragmentation
-        # ratio to land back on the reserved axis, since reserved is what OOMs.
+        # Fitted on ALLOCATED, then scaled onto the reserved axis by the measured
+        # fragmentation ratio: allocated is linear in R by construction, while
+        # reserved carries a big non-monotone allocator-warmup constant at low R
+        # that drives a straight-line fit negative.
         bpr = float(np.polyfit(Ra, ma * 2 ** 20, 1)[0])
         big = R >= R.max() / 30.0
         frag = float(np.median(m[big] / ma[big])) if big.any() else 1.0
-        wall = vram_mb * 2 ** 20 / (bpr * frag) if vram_mb else 0.0
-        xs = np.geomspace(R.max(), max(r_max, R.max(), wall) * 1.6, 48)
-        ax.loglog(xs, np.polyval(np.polyfit(Ra, ma, 1), xs) * frag, ':',
-                  color=col, lw=1.8, alpha=.75,
-                  label=f'{a}  predicted, {bpr:.0f} B/ray x {frag:.2f} frag')
-        if wall:
-            walls.append((a, col, wall))
-            print(f'    {a}: predicted monolithic wall {wall:.2e} rays '
-                  f'({bpr:.0f} B/ray, {vram_mb/1024:.0f} GB)')
+        fit = np.polyfit(Ra, ma, 1)
+        ahead = [v for v in rungs if v > R.max()]
+        if ahead:
+            xs = [R.max()] + ahead
+            ax.plot([xi[v] for v in xs],
+                    np.polyval(fit, xs) * frag / 1024, ':', color=col, lw=1.8,
+                    alpha=.85)
+        if vram_mb:
+            wall = vram_mb * 2 ** 20 / (bpr * frag)
+            walls.append((a_, col, wall))
+            print(f'    {a_}: predicted monolithic wall {wall:.2e} rays '
+                  f'({bpr:.0f} B/ray x {frag:.2f} frag)')
 
     if vram_mb:
-        ax.axhline(vram_mb, color='k', lw=1.2, alpha=.7)
-        lo, hi_y = ax.get_ylim()
-        ax.set_ylim(lo, max(hi_y, vram_mb * 2.5))
-        ax.text(0.985, vram_mb * 1.1, f'device VRAM {vram_mb/1024:.0f} GB',
-                transform=ax.get_yaxis_transform(), ha='right',
-                fontsize=8, alpha=.85)
-    # The observed OOM is what the dotted lines are checked against: a predicted
-    # wall near it validates the linear claim; a large gap voids it.
+        ax.axhline(vram_mb / 1024, color='k', ls='--', lw=1.6, label='Limit')
+        ax.set_ylim(0, vram_mb / 1024 * 1.25)
+
     ooms = sorted({r['rays'] for r in rows if r['status'] == 'oom'})
     for x in ooms:
-        ax.axvline(x, color='r', ls='--', lw=1.6, alpha=.85)
+        if x in xi:
+            ax.plot(xi[x], ax.get_ylim()[1] * .94, 'rx', ms=9, mew=2.2)
     if ooms:
-        ax.plot([], [], 'r--', lw=1.6, label=f'observed OOM  {ooms[0]:.0e}')
+        ax.plot([], [], 'rx', ms=9, mew=2.2, label='observed OOM')
 
-    ax.set(xlabel='rays launched', ylabel='peak memory reserved [MB]',
-           title='memory: measured (solid) vs predicted past the wall (dotted)')
-    ax.legend(fontsize=8, loc='upper left', framealpha=.9)
-    ax.grid(alpha=.3, which='both')
+    ax.set_xticks(range(len(rungs)))
+    ax.set_xticklabels([_tick(v) for v in rungs], fontsize=10)
+    ax.set_xlim(-0.35, len(rungs) - 0.65)
+    ax.set_xlabel('rays launched')
+    ax.set_title('GPU memory consumption [GB]', loc='left', fontsize=12)
+    for sp in ('top', 'right'):
+        ax.spines[sp].set_visible(False)
+    ax.legend(fontsize=9, frameon=False, loc='upper left',
+              bbox_to_anchor=(0.02, 0.98))
+
     fig.tight_layout(); p = os.path.join(out, 'memory_vs_rays.png')
     fig.savefig(p, dpi=110); plt.close(fig); written.append(p)
 
