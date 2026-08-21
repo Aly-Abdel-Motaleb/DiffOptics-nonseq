@@ -86,6 +86,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime
 
 import numpy as np
@@ -785,14 +786,20 @@ def sweep(args, kcal, csv_path):
                                 r['rep'], hist_path=hp))
             _report(row)
         except Exception as e:                       # noqa: BLE001
-            if not _is_oom(e):
-                raise
-            # The OOM IS the datum: record it and keep sweeping. The wall is not
-            # always monotone (fragmentation), and a non-monotone wall is itself
-            # a finding - so do NOT break out of the arm here.
-            row.update(status='oom', note=str(e).splitlines()[0][:180],
+            # Never abort the arm. The sweep's job is to deliver the WHOLE
+            # ladder; one bad rung is a row in the CSV, not the end of the run.
+            # An OOM IS the datum (the wall is not always monotone, and a
+            # non-monotone wall is itself a finding); any other exception is a
+            # bug, recorded as status='error' with the traceback in the note so
+            # it is loud in the CSV but does not cost the remaining rungs.
+            # load_done() treats neither as done, so a rerun retries them.
+            oom = _is_oom(e)
+            row.update(status='oom' if oom else 'error',
+                       note=str(e).splitlines()[0][:180],
                        t_wall_s=NAN, mem_alloc_mb=NAN)
-            print('   OOM')
+            print('   OOM' if oom else f'   ERROR {type(e).__name__}: {e}')
+            if not oom:
+                traceback.print_exc()
         finally:
             gc.collect()
             if device.type == 'cuda':
@@ -801,6 +808,16 @@ def sweep(args, kcal, csv_path):
         append_row(csv_path, row)
         if i % 10 == 0 and os.path.exists(csv_path):
             shutil.copy(csv_path, csv_path + '.bak')
+
+    # Say plainly how much of the planned matrix actually landed, per arm, so
+    # "did the full ladder run?" is answered by the harness and not by scrolling.
+    done = load_done(csv_path)
+    print('\n  completed rows per arm (of the planned matrix)')
+    for arm in args.arms:
+        want = [r for r in runs if r['arm'] == arm]
+        got = [r for r in want if _key(r) in done]
+        mark = 'ok' if len(got) == len(want) else 'INCOMPLETE'
+        print(f'    {arm:15s} {len(got):3d}/{len(want):<3d} {mark}')
 
 
 def _report(row):
