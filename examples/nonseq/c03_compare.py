@@ -20,7 +20,8 @@ Irradiance maps, from `Analysis -> Illuminance Display -> Table View -> export`:
 
 The reader is deliberately forgiving: it takes either a long `x,y,E` table or a
 bare 2D grid with or without header row/column, comma or whitespace separated.
-What it does require is 512x512 cells covering the right extent - the grids are
+What it does require is that the export mesh matches `--n-fwd` / `--n-back`
+(both default to 512) and covers the right extent - the grids are
 checked against `nonseq.splat`'s cell centres to 1e-9 mm, because a half-pixel
 offset shows up as a spurious radial ring in the difference map and is otherwise
 invisible.
@@ -213,10 +214,40 @@ def read_paths(path):
     return out
 
 
+# Calibrated in c04 against this exact scene: count_p10 = k * rays / n^2, so
+# the per-bin relative MC noise is eps = n / sqrt(k * rays). `k` folds path
+# fraction x lit-area fraction, which is why the two receivers differ by 38x:
+# R1 sprays 17.1 % of the power over +-80 mm, T1T2 puts 64 % inside +-16 mm.
+K_BIN = {'forward': 1.094, 'backward': 0.02867}
+
+
+def bin_noise(label, n, rays):
+    """Predicted per-bin relative MC noise for `n` bins at `rays` source rays."""
+    return n / np.sqrt(K_BIN[label] * rays)
+
+
+def suggest_n(label, rays, target=0.10):
+    """Largest multiple of 16 whose predicted noise is under `target`.
+
+    Snapped DOWN and floored at 16: fewer bins is always the safe direction.
+    """
+    return max(16, 16 * int(np.sqrt(K_BIN[label] * rays) * target // 16))
+
+
 # ------------------------------------------------------------------- our side
-def run_reference(which='a', seed_src=11, mc_seeds=(100, 101, 102, 103, 104)):
-    """Rerun P3. Returns (phi_cap, mean, std, forward map, backward map)."""
-    N = ref.N_SPLIT if which == 'a' else ref.N_MC
+def run_reference(which='a', seed_src=11, mc_seeds=(100, 101, 102, 103, 104),
+                  n_fwd=None, n_back=None, rays=None):
+    """Rerun P3. Returns (phi_cap, mean, std, forward map, backward map).
+
+    `n_fwd`/`n_back` override c02's 512x512 film and `rays` overrides its ray
+    budget. They exist because the mesh is not a free choice: per-bin MC noise
+    is `n / sqrt(k * rays)`, so a 512 mesh at c02's 2e5 rays is ~109 % noise
+    forward and ~676 % backward, and the map gates below then compare two
+    noise fields rather than two irradiances. Raise `rays`, drop `n`, or both -
+    but pick them together, and pass the SAME `n` to the LightTools reader so
+    the two grids stay registered.
+    """
+    N = rays or (ref.N_SPLIT if which == 'a' else ref.N_MC)
     o, d, w = ref.sample_point_source(N, seed=seed_src)
     els = ref.build_elements()
     w_min = ref._w_min(w)
@@ -240,10 +271,11 @@ def run_reference(which='a', seed_src=11, mc_seeds=(100, 101, 102, 103, 104)):
 
     term, _ = runs[0]
     cl = ref.classify(term)
-    I_f = nonseq.splat(cl['p_fwd'], cl['w_fwd'] / ref.PIXEL_F ** 2,
-                       ref.FILM_F, ref.PIXEL_F).numpy()
-    I_b = nonseq.splat(cl['p_back'], cl['w_back'] / ref.PIXEL_B ** 2,
-                       ref.FILM_B, ref.PIXEL_B).numpy()
+    nf = n_fwd or ref.FILM_F[0]
+    nb = n_back or ref.FILM_B[0]
+    pf, pb = 2 * ref.R_RECV / nf, 2 * ref.R_BACK / nb
+    I_f = nonseq.splat(cl['p_fwd'], cl['w_fwd'] / pf ** 2, [nf, nf], pf).numpy()
+    I_b = nonseq.splat(cl['p_back'], cl['w_back'] / pb ** 2, [nb, nb], pb).numpy()
 
     keys = list(stats[0])
     mean = {k: float(np.mean([s[k] for s in stats])) for k in keys}
@@ -430,6 +462,17 @@ def main():
                     help='a = ray splitting ON (trace_split), b = OFF (trace_mc)')
     ap.add_argument('--paths-only', action='store_true')
     ap.add_argument('--dir', default=OUT)
+    ap.add_argument('--n-fwd', type=int, default=None,
+                    help='forward receiver bins per axis (default: c02 FILM_F '
+                         '= 512). MUST match the LightTools receiver mesh, or '
+                         'a chart export fails the cell-centre check.')
+    ap.add_argument('--n-back', type=int, default=None,
+                    help='backward receiver bins per axis (default 512)')
+    ap.add_argument('--rays', type=int, default=None,
+                    help='ray budget on OUR side (default: c02 N_SPLIT/N_MC). '
+                         'Set it to the LightTools ray count so both maps '
+                         'carry the same MC noise - otherwise the map L2 gate '
+                         'measures a difference in ray budget.')
     args = ap.parse_args()
 
     tag = 'split' if args.run == 'a' else 'mc'
@@ -437,7 +480,8 @@ def main():
     print(f'LightTools Run {args.run.upper()} vs {tracer}')
     print(f'  reading {args.dir}')
 
-    phi_cap, mean, std, I_f, I_b = run_reference(args.run)
+    phi_cap, mean, std, I_f, I_b = run_reference(
+        args.run, n_fwd=args.n_fwd, n_back=args.n_back, rays=args.rays)
     print(f'  Phi_cap (ours, {np.degrees(ref.THETA_MAX):.6f} deg cone) '
           f'= {phi_cap:.9f} W')
 
@@ -466,16 +510,30 @@ def main():
     if not args.paths_only:
         maps = [('forward', f'lt_fwd_{tag}.csv', ref.R_RECV, I_f),
                 ('backward', f'lt_back_{tag}.csv', ref.R_BACK, I_b)]
+        n_rays = args.rays or (ref.N_SPLIT if args.run == 'a' else ref.N_MC)
         tot, pairs = {}, []
         for label, fn, half, ours in maps:
+            n = ours.shape[0]
+            eps, best = bin_noise(label, n, n_rays), suggest_n(label, n_rays)
+            fine = eps <= 0.10
+            print(f'\n  [{_OK[fine]}] {label} mesh {n}x{n}, pitch '
+                  f'{2 * half / n:.4f} mm -> predicted per-bin noise '
+                  f'{eps:.1%} at {n_rays:.0e} rays')
+            if not fine:
+                need = (n / 0.10) ** 2 / K_BIN[label]
+                print(f'         under 10 % needs {best}x{best} at this ray '
+                      f'count, or {need:.1e} rays at {n}x{n}.')
+                print(f'         until one of those holds the map L2 below '
+                      f'compares two noise fields, not two irradiances - read '
+                      f'the radial profile and the path table instead.')
             p = os.path.join(args.dir, fn)
             rays = os.path.join(args.dir, fn.replace('.csv', '_rays.csv'))
             if os.path.exists(rays):
-                print(f'\n  using {os.path.basename(rays)} (raw hits, binned '
+                print(f'  using {os.path.basename(rays)} (raw hits, binned '
                       f'here - no half-pixel risk)')
-                I_lt = read_rays(rays, half)
+                I_lt = read_rays(rays, half, n)
             elif os.path.exists(p):
-                I_lt = read_map(p, half)
+                I_lt = read_map(p, half, n)
             else:
                 print(f'\n  [--  ] {fn} missing - skipping the {label} map')
                 continue
