@@ -1,8 +1,7 @@
 # P5 — LightTools build + comparison, two lenses
 
-Build the `c05_two_lens.py` scene in LightTools, run it twice — splitting ON and
-OFF — and compare against `trace_split` and `trace_mc` with
-`c05_compare.py`.
+Build the `c05_two_lens.py` scene in LightTools, run it with probabilistic ray
+splitting (Monte Carlo), and compare against `trace_mc` with `c05_compare.py`.
 
 This is a **complete build from `File → New`**. It does not assume the c03
 one-lens model is open. Where a step is identical to c03 it is repeated here in
@@ -370,7 +369,7 @@ For each one:
    | **Reflectance** | 20.00 % / 10.00 % |
    | **Transmittance** | 80.00 % / 90.00 % |
    | Absorption | 0.00 % (greyed, = 100 − R − T) |
-   | Preferred Direction | **unchecked** (Run A) |
+   | Preferred Direction | **checked** — required for probabilistic splitting, Step 5 |
    | **Advanced Properties** | **None** |
    | Include Contamination Scatter | unchecked |
 
@@ -514,7 +513,7 @@ limit.
 | tab | set |
 |---|---|
 | Spectral | single wavelength **532.8 nm** |
-| Random Numbers | note the seed; Run B wants 5 different ones |
+| Random Numbers | note the seed; run 5 different ones |
 | Data Collection / Update | check here for a max-intersection cap |
 
 ### Depth cap **[open]**
@@ -528,38 +527,28 @@ asymmetry rather than assume parity.
 ### Splitting is NOT set here **[2026-verified]**
 
 It lives on the **optical property**, `Ray Trace Mode` (Step 3). Both properties
-must be changed together:
+must be set the same way:
 
-| run | Ray Trace Mode | Preferred Direction | equivalent |
-|---|---|---|---|
-| **Run A** | **Split Rays (Reflected and Transmitted)** | unchecked | `trace_split` |
-| **Run B** | Split Rays | **checked** + Probabilistic Ray Split, threshold **1.0** | `trace_mc` |
+| Ray Trace Mode | Preferred Direction | equivalent |
+|---|---|---|
+| **Split Rays (Reflected and Transmitted)** | **checked** + Probabilistic Ray Split, threshold **1.0** | `trace_mc` |
 
 ---
 
-## Step 6 — run twice
+## Step 6 — run
 
-### Run A — splitting **ON** → compares against `trace_split`
-
-Deterministic branch tree. Expect the exact fractions in §7 — **51.8400 /
-20.0000 / 12.8000** — to the digit. Pure geometry plus constant coatings, no
-sampling anywhere in either code. 1e5–1e6 rays; splitting is not noise-limited on
-the direct path, so more rays buy little.
-
-### Run B — splitting **OFF**, 1e6 rays → compares against `trace_mc`
-
-The apples-to-apples check: LightTools' MC and `trace_mc` are the same estimator
-class — one child per hit, branch chosen with probability ρ, weight divided by ρ.
-Run 5 seeds at 1e6 so the comparison has an error bar. Repeat at 1e5 / 1e6 / 1e7
-to confirm the error falls with a log-log slope of ≈ −0.5.
+Splitting probabilistic (one child per hit, branch chosen with probability ρ,
+weight divided by ρ) at 1e6 rays → compares against `trace_mc`. LightTools' MC
+and `trace_mc` are the same estimator class, so this is an apples-to-apples
+check. Run 5 seeds at 1e6 so the comparison has an error bar. Repeat at
+1e5 / 1e6 / 1e7 to confirm the error falls with a log-log slope of ≈ −0.5.
 
 ---
 
 ## Step 7 — reference numbers
 
-All from `trace_split` at 50 000 rays, depth 14, which is exact for the closed
-forms. **Percentages are of Φ_cap** — normalise LightTools by the flux it reports
-launching into the cone.
+Closed-form / exact values, depth 14. **Percentages are of Φ_cap** — normalise
+LightTools by the flux it reports launching into the cone.
 
 ### Power by path
 
@@ -638,10 +627,8 @@ exactly like a physics error.
 Export one file per receiver into `examples/nonseq/c05_out/`:
 
 ```
-lt_fwd_mc_rays.txt      forward receiver, Run B
-lt_back_mc_rays.txt     backward receiver, Run B
-lt_fwd_split_rays.txt   forward receiver, Run A
-lt_back_split_rays.txt  backward receiver, Run A
+lt_fwd_mc_rays.txt      forward receiver
+lt_back_mc_rays.txt     backward receiver
 ```
 
 LightTools appends its own run number — `lt_fwd_mc_rays.1.txt` is fine and is
@@ -677,13 +664,43 @@ If you must use the chart export instead, the receiver mesh **has to** match Ste
 `x_mm,y_mm,E` at cell centres in W/mm². The reader verifies the cell centres
 against `nonseq.splat`'s to 1e-9 mm and refuses a mismatch.
 
+### Step 8a — chart export walkthrough, both receivers **[confirm]**
+
+Menu path for the CSV, per receiver:
+
+1. In the **System Navigator**, click the receiver (not the dummy surface it
+   sits on) — **Forward** for z = 200, **Backward** for z = −80.
+2. `Analysis → Illuminance/Irradiance Receiver Data` (or double-click the
+   receiver, which opens the same chart) → confirm **Irradiance, W/mm²** is
+   the plotted quantity, not illuminance/lux — Step 0 set Radiometric, but
+   this dialog has its own unit dropdown and it does not inherit that setting.
+3. On the chart window: `File → Export → Data (CSV)` (or the export/save icon
+   on the chart toolbar — labelling has moved between 2021–2026 builds).
+4. Save as:
+
+   | receiver | file |
+   |---|---|
+   | forward, z = 200 | `lt_fwd_mc.csv` |
+   | backward, z = −80 | `lt_back_mc.csv` |
+
+   into `examples/nonseq/c05_out/`. `c05_compare.py` globs
+   `lt_<name>_mc*.csv` (`_rays` in the name routes to the raw-hit reader
+   instead, so do not add it to a chart export's filename).
+5. Repeat for the other receiver before closing the Simulation Manager —
+   closing it can discard the in-memory chart data on some builds.
+
+Open the CSV once before trusting it: header row `x_mm,y_mm,E`, one row per
+cell, cell count **exactly** 64×64 (forward) or 32×32 (backward). A row count
+of 4096 / 1024 confirms the mesh; anything else means Step 4a's mesh was not
+what actually got built, and the reader will refuse it rather than silently
+rebinning.
+
 ---
 
 ## Step 9 — compare
 
 ```
-python examples/nonseq/c05_compare.py --run b --rays 1000000
-python examples/nonseq/c05_compare.py --run a --rays 50000     # Run A
+python examples/nonseq/c05_compare.py --rays 1000000
 ```
 
 `--rays` must equal the LightTools ray count, or the two maps carry different MC
@@ -697,13 +714,13 @@ partial upload still produces the figure.
 
 ### Tolerances
 
-| quantity | Run A (split) | Run B (MC, 1e6) | gated? |
-|---|---|---|---|
-| `T1T2T3T4`, `R1`, `T1R2T1` | ±0.01 % of Φ_cap | ±0.05 % + 3σ | **yes** |
-| forward receiver total | ±0.5 % | ±0.5 % | **yes** |
-| backward receiver total | ±1.0 % | ±1.0 % | **yes** |
-| energy ledger | 0.1 % | 0.1 % | **yes** |
-| map relative L2 | vs noise floor | vs noise floor | reported only |
+| quantity | MC, 1e6 | gated? |
+|---|---|---|
+| `T1T2T3T4`, `R1`, `T1R2T1` | ±0.05 % + 3σ | **yes** |
+| forward receiver total | ±0.5 % | **yes** |
+| backward receiver total | ±1.0 % | **yes** |
+| energy ledger | 0.1 % | **yes** |
+| map relative L2 | vs noise floor | reported only |
 
 The L2 is deliberately **not** gated against a fixed number. Two independent
 Monte Carlo maps at ~9 % per-bin noise differ in L2 by about `sqrt(2) × 9 % ≈
@@ -742,16 +759,16 @@ disagrees, check this list before suspecting physics.
 
 1. The scene and why lens 2 is lens 1 mirrored (exact, no new design).
 2. The focus check at z = 146.5 — geometry before physics.
-3. The three closed forms, all three codes: closed form / `trace_split` /
-   LightTools Run A.
-4. Run B vs `trace_mc`, with the 5-seed error bar.
+3. The three closed forms vs `trace_mc` vs LightTools.
+4. `trace_mc` repeatability, with the 5-seed error bar.
 5. The bin rule: why 64² and 32² and not 512², with the noise arithmetic.
 6. `c05_maps_mc.png` — the deliverable figure.
 7. The honest bit: `back_h5r1` has no closed form, and the backward receiver's
    realised noise is worse than the flat-field rule predicts. Both are stated,
    neither is hidden.
 8. What LightTools cannot do: `dΦ_back/dR1` and `dΦ_fwd/dR2` out of one backward
-   pass, matching finite differences to 2e-8 and 6e-13.
+   pass through `trace_mc`, matching a fixed-seed finite difference to a few
+   percent.
 
 ---
 
@@ -776,6 +793,6 @@ writes nothing back.
 1. Receiver mesh dialog location **[confirm]**.
 2. Material tab path for User Defined constant index **[confirm]**.
 3. Whether an explicit max-intersection cap exists **[open]**.
-4. `Probabilistic Ray Split` + threshold 1.0 as the Run B equivalent **[confirm]**
-   — carried over from the c03 build, not independently re-checked for two
-   properties in one model.
+4. `Probabilistic Ray Split` + threshold 1.0 as the `trace_mc` equivalent
+   **[confirm]** — carried over from the c03 build, not independently
+   re-checked for two properties in one model.

@@ -5,15 +5,19 @@ PHASE 2 - STAGE 5b: the two-lens scene against LightTools.
 This proves it against a commercial non-sequential tracer, on the same scene,
 and draws the figure that says so.
 
-    python examples/nonseq/c05_compare.py --run b --rays 1000000
-    python examples/nonseq/c05_compare.py --run b --paths-only     # no maps
-    python examples/nonseq/c05_compare.py --run b --dir /some/where
+    python examples/nonseq/c05_compare.py --rays 1000000
+    python examples/nonseq/c05_compare.py --paths-only     # no maps
+    python examples/nonseq/c05_compare.py --dir /some/where
 
-Always writes `c05_maps_mc.png` (or `_split.png` for `--run a`) into `--dir`:
-one row per receiver, four columns - LightTools | ours | signed difference |
-radial profile. Receivers whose LightTools export is missing still get a row,
-with the LightTools panel left blank, so a partial upload still produces the
-figure rather than an error.
+Always writes `c05_maps_mc.png` into `--dir`: one row per receiver, four
+columns - LightTools | ours | signed difference | radial profile. Receivers
+whose LightTools export is missing still get a row, with the LightTools panel
+left blank, so a partial upload still produces the figure rather than an
+error.
+
+Monte Carlo only - `trace_split` (deterministic ray splitting, LightTools Run
+A) is not run here. This compares `trace_mc` against a LightTools MC export
+(splitting OFF).
 
 --------------------------------------------------------------------------------
 WHAT IT LOOKS FOR IN `--dir`
@@ -25,7 +29,7 @@ Per receiver, in this order, first match wins:
     lt_<name>_<tag>_rays*.csv     raw hits, renamed
     lt_<name>_<tag>*.csv          chart export (illuminance table)
 
-with `<name>` in {fwd, back} and `<tag>` = split for `--run a`, mc for `--run b`.
+with `<name>` in {fwd, back} and `<tag>` = mc.
 The `*` absorbs the run number LightTools appends - `lt_fwd_mc_rays.1.txt` is
 matched as it comes off the export, no renaming needed. If several match, the
 newest wins and the chosen name is printed.
@@ -92,8 +96,7 @@ from c03_compare import (  # noqa: E402
 
 OUT = os.path.join(_HERE, 'c05_out')
 
-TOL = {'closed_form': 0.01,      # % of Phi_cap, run a (deterministic)
-       'closed_form_mc': 0.05,   # run b, on top of the MC sigma
+TOL = {'closed_form_mc': 0.05,   # % of Phi_cap, on top of the MC sigma
        'recv_rel': 0.5,          # % of Phi_cap, forward
        'recv_rel_back': 1.0,     # backward catches a wider, noisier spray
        'ledger': 0.1}
@@ -134,32 +137,28 @@ def find_paths(directory, tag):
 
 
 # ------------------------------------------------------------------ our side
-def run_reference(which='b', rays=None, seed_src=11,
+def run_reference(rays=None, seed_src=11,
                   mc_seeds=(100, 101, 102, 103, 104), n_override=None,
                   strict=False):
-    """Rerun the c05 scene. Returns (phi_cap, mean, std, maps, bins).
+    """Rerun the c05 scene with `trace_mc`. Returns (phi_cap, mean, std, maps, bins).
 
     `maps` is {receiver name: [n,n] W/mm^2}, `bins` the table from
-    `c05.bin_table`. Run 'a' is one deterministic `trace_split`; run 'b' is five
-    `trace_mc` runs so every reported number carries a standard deviation.
+    `c05.bin_table`. Five `trace_mc` seeds are run so every reported number
+    carries a standard deviation.
 
     The mesh comes from the FIRST run's landing counts and is then held fixed
     across the remaining seeds - otherwise each seed would splat onto a slightly
     different grid and the spread would mix two effects.
     """
-    N = int(rays or (c5.N_SPLIT if which == 'a' else int(1e6)))
+    N = int(rays or int(1e6))
     o, d, w = c5.sample_point_source(N, seed=seed_src)
     els = c5.build_elements()
     w_min = c5._w_min(w)
 
     runs = []
-    if which == 'a':
-        runs.append(c5.trace_split(o, d, w, els, c5.WAVELENGTH,
-                                   max_depth=c5.MAX_DEPTH, w_min=w_min))
-    else:
-        for s in mc_seeds:
-            runs.append(c5.trace_mc(o, d, w, els, c5.WAVELENGTH, seed=s,
-                                    max_depth=c5.MAX_DEPTH, w_min=w_min))
+    for s in mc_seeds:
+        runs.append(c5.trace_mc(o, d, w, els, c5.WAVELENGTH, seed=s,
+                                max_depth=c5.MAX_DEPTH, w_min=w_min))
 
     stats = []
     for term, tally in runs:
@@ -204,7 +203,7 @@ def run_reference(which='b', rays=None, seed_src=11,
 
 
 # ---------------------------------------------------------------- comparisons
-def compare_paths(lt, phi_cap_lt, mean, std, which):
+def compare_paths(lt, phi_cap_lt, mean, std):
     """The three unshared buckets, LightTools vs ours vs the closed form.
 
     Only three - see `c05_two_lens`'s docstring. With four partial surfaces most
@@ -217,7 +216,7 @@ def compare_paths(lt, phi_cap_lt, mean, std, which):
               '\n  export it (Ray Paths -> ForwardAll) and rerun')
         return True
     exact = {k: 100 * v for k, v in c5.closed_form().items()}
-    tol = TOL['closed_form'] if which == 'a' else TOL['closed_form_mc']
+    tol = TOL['closed_form_mc']
     ok = True
     for name, want in exact.items():
         if name not in lt:
@@ -225,9 +224,9 @@ def compare_paths(lt, phi_cap_lt, mean, std, which):
             continue
         a = 100 * lt[name] / phi_cap_lt
         b = 100 * mean[name]
-        sig = 100 * std[name] if which == 'b' else None
+        sig = 100 * std[name]
         ok &= _line(f'{name} (exact {want:.3f})', a, b,
-                    tol + (3 * (sig or 0)), '%', sigma=sig)
+                    tol + (3 * sig), '%', sigma=sig)
     return ok
 
 
@@ -413,9 +412,8 @@ def _parse_n(items):
 
 def main():
     ap = argparse.ArgumentParser(
-        description='two-lens scene vs LightTools; always writes the map figure')
-    ap.add_argument('--run', choices=['a', 'b'], default='b',
-                    help='a = ray splitting ON (trace_split), b = OFF (trace_mc)')
+        description='two-lens scene vs LightTools (Monte Carlo only); '
+                    'always writes the map figure')
     ap.add_argument('--dir', default=OUT, help='where the LightTools exports are')
     ap.add_argument('--rays', type=int, default=None,
                     help='OUR ray budget. Set it to the LightTools ray count so '
@@ -428,16 +426,14 @@ def main():
     ap.add_argument('--paths-only', action='store_true')
     args = ap.parse_args()
 
-    tag = 'split' if args.run == 'a' else 'mc'
-    tracer = 'trace_split' if args.run == 'a' else 'trace_mc'
+    tag = 'mc'
     os.makedirs(args.dir, exist_ok=True)
-    print(f'LightTools Run {args.run.upper()} vs {tracer}')
+    print('LightTools (splitting OFF) vs trace_mc')
     print(f'  two lenses: R1 = {c5.R1_COAT} (S1,S2), R2 = {c5.R2_COAT} (S3,S4)')
     print(f'  reading {args.dir}')
 
     phi_cap, mean, std, maps, bins, n_rays = run_reference(
-        args.run, rays=args.rays, n_override=_parse_n(args.n),
-        strict=args.strict_bins)
+        rays=args.rays, n_override=_parse_n(args.n), strict=args.strict_bins)
     print(f'  Phi_cap (ours) = {phi_cap:.9f} W from {n_rays:.0e} rays\n')
     print('  mesh, chosen by N = 0.1 * sqrt(rays landing on the receiver):')
     print(f'  {"receiver":10s} {"rays on":>10s} {"N":>5s} {"eps pred":>9s} '
@@ -454,7 +450,7 @@ def main():
     if p_paths:
         print(f'\n  path table: {os.path.basename(p_paths)}')
     phi_cap_lt = lt_paths.get('total', phi_cap)
-    ok &= compare_paths(lt_paths, phi_cap_lt, mean, std, args.run)
+    ok &= compare_paths(lt_paths, phi_cap_lt, mean, std)
 
     if not args.paths_only:
         rows, tot = [], {}
