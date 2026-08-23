@@ -114,6 +114,7 @@ def find_export(directory, name, tag):
     """
     for pattern, kind in ((f'lt_{name}_{tag}_rays*.txt', 'rays'),
                           (f'lt_{name}_{tag}_rays*.csv', 'rays'),
+                          (f'lt_{name}_{tag}_rays*.ray', 'rays'),
                           (f'lt_{name}_{tag}*.csv', 'map'),
                           (f'lt_{name}_{tag}*.txt', 'map')):
         hits = sorted(glob.glob(os.path.join(directory, pattern)),
@@ -139,7 +140,7 @@ def find_paths(directory, tag):
 # ------------------------------------------------------------------ our side
 def run_reference(rays=None, seed_src=11,
                   mc_seeds=(100, 101, 102, 103, 104), n_override=None,
-                  strict=False):
+                  strict=False, device=None):
     """Rerun the c05 scene with `trace_mc`. Returns (phi_cap, mean, std, maps, bins).
 
     `maps` is {receiver name: [n,n] W/mm^2}, `bins` the table from
@@ -149,10 +150,13 @@ def run_reference(rays=None, seed_src=11,
     The mesh comes from the FIRST run's landing counts and is then held fixed
     across the remaining seeds - otherwise each seed would splat onto a slightly
     different grid and the spread would mix two effects.
+
+    `device` defaults to CPU (torch's own default) - pass 'cuda' explicitly to
+    use a GPU. 5 seeds x 1e6 rays in float64 is slow on CPU.
     """
     N = int(rays or int(1e6))
-    o, d, w = c5.sample_point_source(N, seed=seed_src)
-    els = c5.build_elements()
+    o, d, w = c5.sample_point_source(N, seed=seed_src, device=device)
+    els = c5.build_elements(device=device)
     w_min = c5._w_min(w)
 
     runs = []
@@ -193,7 +197,7 @@ def run_reference(rays=None, seed_src=11,
         key, n = rc['name'], bins[rc['name']]['n']
         pitch = 2.0 * rc['half'] / n
         maps[key] = nonseq.splat(cl0['p_' + key], cl0['w_' + key] / pitch ** 2,
-                                 [n, n], pitch).numpy()
+                                 [n, n], pitch).detach().cpu().numpy()
 
     keys = list(stats[0])
     mean = {k: float(np.mean([s[k] for s in stats])) for k in keys}
@@ -424,6 +428,10 @@ def main():
                     help='size the mesh by MEASURED noise instead of the '
                          'N/sqrt(R) rule (coarser where the flux is concentrated)')
     ap.add_argument('--paths-only', action='store_true')
+    ap.add_argument('--device', default=None,
+                    help="'cuda' or 'cpu'. Default is torch's own default "
+                         '(CPU). 5 seeds x 1e6 rays in float64 is slow on '
+                         "CPU - pass --device cuda if you're in a GPU runtime.")
     args = ap.parse_args()
 
     tag = 'mc'
@@ -431,9 +439,12 @@ def main():
     print('LightTools (splitting OFF) vs trace_mc')
     print(f'  two lenses: R1 = {c5.R1_COAT} (S1,S2), R2 = {c5.R2_COAT} (S3,S4)')
     print(f'  reading {args.dir}')
+    if args.device:
+        print(f'  device {args.device}')
 
     phi_cap, mean, std, maps, bins, n_rays = run_reference(
-        rays=args.rays, n_override=_parse_n(args.n), strict=args.strict_bins)
+        rays=args.rays, n_override=_parse_n(args.n), strict=args.strict_bins,
+        device=args.device)
     print(f'  Phi_cap (ours) = {phi_cap:.9f} W from {n_rays:.0e} rays\n')
     print('  mesh, chosen by N = 0.1 * sqrt(rays landing on the receiver):')
     print(f'  {"receiver":10s} {"rays on":>10s} {"N":>5s} {"eps pred":>9s} '
